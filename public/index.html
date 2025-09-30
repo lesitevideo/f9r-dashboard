@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>F9R Dashboard</title>
+    <link href="/bootstrap.min.css" rel="stylesheet" />
+    <link rel="stylesheet" href="/leaflet.css" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <nav class="navbar navbar-dark bg-dark">
+      <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">F9R Dashboard</span>
+        <span class="text-light small" id="serialInfo"></span>
+      </div>
+    </nav>
+
+    <div class="container-fluid py-3">
+      <div class="row g-3">
+        <div class="col-12 col-lg-4">
+          <div class="card shadow-sm">
+            <div class="card-body">
+              <h5 class="card-title">Statut</h5>
+              <div class="row row-cols-2 g-2 small">
+                <div><strong>Fix:</strong> <span id="fixType">—</span></div>
+                <div><strong>Sats (used/in-view):</strong> <span id="sats">0 / 0</span></div>
+                <div><strong>HDOP:</strong> <span id="hdop">—</span></div>
+                <div><strong>Alt (m):</strong> <span id="alt">—</span></div>
+                <div><strong>Vitesse (km/h):</strong> <span id="speed">0</span></div>
+                <div><strong>Cap (°):</strong> <span id="course">0</span></div>
+                <div><strong>Lat:</strong> <span id="lat">—</span></div>
+                <div><strong>Lon:</strong> <span id="lon">—</span></div>
+              </div>
+              <hr/>
+              <div class="row row-cols-2 g-2 small">
+                <div><strong>NMEA:</strong> <span id="nmea">0</span></div>
+                <div><strong>Bad:</strong> <span id="bad">0</span></div>
+                <div><strong>GGA:</strong> <span id="gga">0</span></div>
+                <div><strong>RMC:</strong> <span id="rmc">0</span></div>
+              </div>
+            </div>
+          </div>
+            
+
+      <div class="row g-3 mt-3">
+        <div class="col-12 d-none">
+          <div class="card shadow-sm">
+            <div class="card-body">
+              <h5 class="card-title">Sortie NMEA locale</h5>
+              <div class="row g-2 align-items-end">
+                <div class="col-4">
+                  <label class="form-label">Port série</label>
+                  <input id="outPath" class="form-control" placeholder="/dev/ttyS0" />
+                </div>
+                <div class="col-4">
+                  <label class="form-label">Baud</label>
+                  <input id="outBaud" class="form-control" type="number" value="115200" />
+                </div>
+                <div class="col-2 d-grid">
+                  <button id="btnApplyOut" class="btn btn-primary">Appliquer</button>
+                </div>
+                <div class="col-12 form-check mt-2">
+                  <input class="form-check-input" type="checkbox" id="outEnable" />
+                  <label class="form-check-label" for="outEnable">Activer la rediffusion NMEA vers ce port</label>
+                </div>
+                <div class="col-12 form-check mt-2">
+                  <input class="form-check-input" type="checkbox" id="forwardCorr" checked />
+                  <label class="form-check-label" for="forwardCorr">Envoyer aussi les corrections NTRIP vers ce port</label>
+                </div>
+              </div>
+              <div class="small text-muted mt-2" id="outStatus">Inactif</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12">
+          <div class="card shadow-sm">
+            <div class="card-body">
+              <h5 class="card-title">Client NTRIP</h5>
+              <div class="row g-2 align-items-end">
+                    <div class="col-4">
+                      <label class="form-label">Hôte</label>
+                      <input id="ntripHost" class="form-control" placeholder="caster.exemple.fr" />
+                    </div>
+                    <div class="col-2">
+                      <label class="form-label">Port</label>
+                      <input id="ntripPort" type="number" class="form-control" value="2101" />
+                    </div>
+                    <div class="col-3">
+                      <label class="form-label">Mountpoint</label>
+                      <input id="ntripMount" class="form-control" placeholder="MOUNT" />
+                    </div>
+                </div>
+                <div class="row mt-2 g-2 align-items-end">
+                    <div class="col-3">
+                      <label class="form-label">Utilisateur</label>
+                      <input id="ntripUser" class="form-control" />
+                    </div>
+                    <div class="col-3 mt-2">
+                      <label class="form-label">Mot de passe</label>
+                      <input id="ntripPass" type="password" class="form-control" />
+                    </div>
+                </div>
+                <div class="row mt-2 g-2 align-items-end">
+                    <div class="col-3 mt-2 d-grid">
+                      <button id="btnNtripConnect" class="btn btn-success">Se connecter</button>
+                    </div>
+                    <div class="col-4 mt-2 d-grid">
+                      <button id="btnNtripDisconnect" class="btn btn-outline-danger">Se déconnecter</button>
+                    </div>
+                    <div class="col-12 small text-muted mt-2" id="ntripStatus">NTRIP: déconnecté</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+                     
+            
+        </div>
+
+        <div class="col-12 col-lg-8">
+          <div class="card shadow-sm">
+            <div class="card-body p-0">
+              <div id="map"></div>
+          
+            </div>
+     
+              
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/leaflet.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
