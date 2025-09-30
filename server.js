@@ -1,304 +1,477 @@
-// server.js — F9R Dashboard (Node.js + Express + Socket.IO)
-// Lit /dev/serial0 @ 38400, parse NMEA (GGA/RMC/GSV), diffuse la télémétrie,
-// NTRIP client + rediffusion série + envoi périodique d'une trame NMEA GGA au caster
+// server.js – F9R USB single-port (NMEA out + RTCM in) + NTRIP forward + GUI
+// Node >= 18
+//
+// ENV override examples:
+//   SERIAL_PATH=/dev/ttyACM1 SERIAL_BAUD=230400 node server.js
+//   NTRIP_HOST=caster.kinoki.fr NTRIP_PORT=2101 NTRIP_MOUNT=CHAT NTRIP_USER=xxxxx NTRIP_PASS=xxxxxxx node server.js
+//
+// Front: sert / (index.html, app.js) via Express + Socket.IO (telemetry)
 
-import express from "express";
-import { createServer } from "http";
-import { Server as SocketIOServer } from "socket.io";
-import { SerialPort } from "serialport";
-import * as dotenv from "dotenv";
-import net from "net";
+import fs from 'fs';
+import path from 'path';
+import http from 'http';
+import express from 'express';
+import { Server } from 'socket.io';
+import net from 'net';
+import { SerialPort } from 'serialport';
 
-dotenv.config();
 
-const SERIAL_PATH = process.env.SERIAL_PATH || "/dev/serial0";
-const SERIAL_BAUD = parseInt(process.env.SERIAL_BAUD || "38400", 10);
-const HTTP_PORT = parseInt(process.env.HTTP_PORT || "8080", 10);
 
-// Intervalle d'envoi GGA vers le caster (en secondes)
-const NTRIP_NMEA_INTERVAL_SEC = parseInt(process.env.NTRIP_NMEA_INTERVAL_SEC || "10", 10); // 5–60 recommandé
+// ------------------------- Config -------------------------
+const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8080', 10);
 
+const SERIAL_PATH = process.env.SERIAL_PATH || '/dev/ttyACM0';
+const SERIAL_BAUD = parseInt(process.env.SERIAL_BAUD || '115200', 10);
+
+const NTRIP_HOST  = process.env.NTRIP_HOST  || 'caster.kinoki.fr';
+const NTRIP_PORT  = parseInt(process.env.NTRIP_PORT || '2101', 10);
+const NTRIP_MOUNT = process.env.NTRIP_MOUNT || 'DEV';
+const NTRIP_USER  = process.env.NTRIP_USER  || 'xxxxxx';
+const NTRIP_PASS  = process.env.NTRIP_PASS  || 'xxxxxx';
+
+// Envoi périodique de la dernière GGA au caster (certains VRS l’exigent)
+const NTRIP_SEND_GGA = (process.env.NTRIP_SEND_GGA || 'true') === 'true';
+const NTRIP_NMEA_INTERVAL_SEC = parseInt(process.env.NTRIP_NMEA_INTERVAL_SEC || '10', 10);
+
+// ------------------------- State --------------------------
+const state = {
+  lastFix: null,                // résumé GGA/RMC
+  track: [],                    // option: trace courte
+  stats: { nmea: 0, bad: 0, gga: 0, rmc: 0, gsv: 0, gsa: 0 },
+  serialIn: { path: SERIAL_PATH, baud: SERIAL_BAUD },
+  ntrip: { connected: false, host: NTRIP_HOST, port: NTRIP_PORT, mount: NTRIP_MOUNT, bytes: 0, error: null, lastGGAUpTs: null },
+
+  // Satellites
+  sat: {
+    gsvSeq: {},            // séquences GSV par talker (GP/GL/GA/GB)
+    _talker: {},           // résumé consolidé par talker
+    inView: 0,             // total "vus"
+    tracked: 0,            // approx "suivis" (SNR>0)
+    used: [],              // PRN utilisés (GSA)
+    dop: { pdop: null, hdop: null, vdop: null },
+    perConstellation: {
+      GPS: { inView: 0, used: 0 },
+      GLONASS: { inView: 0, used: 0 },
+      GALILEO: { inView: 0, used: 0 },
+      BEIDOU: { inView: 0, used: 0 },
+      OTHER: { inView: 0, used: 0 }
+    },
+    _usedByConst: {
+      GPS: new Set(), GLONASS: new Set(), GALILEO: new Set(), BEIDOU: new Set(), OTHER: new Set()
+    }
+  },
+
+  // Index PRN -> constellation (alimenté par GSV)
+  satIndexByPRN: new Map(),
+
+  // Mémo dernière GGA brute (pour VRS)
+  lastGGALine: null
+};
+
+// ------------------------- HTTP + WS ----------------------
 const app = express();
-const httpServer = createServer(app);
-const io = new SocketIOServer(httpServer, { cors: { origin: "*" } });
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
+// Sert le dossier courant (index.html, app.js, etc.)
+//app.use(express.static(path.join(process.cwd())));
 app.use(express.static("public"));
 app.use(express.json());
 
-// -------------------- Helpers NMEA --------------------
-function checksumOK(nmea) {
-  const star = nmea.indexOf("*");
-  if (star === -1) return false;
-  const data = nmea.slice(1, star);
-  let sum = 0;
-  for (let i = 0; i < data.length; i++) sum ^= data.charCodeAt(i);
-  const hex = sum.toString(16).toUpperCase().padStart(2, "0");
-  const chk = nmea.slice(star + 1, star + 3).toUpperCase();
-  return hex === chk;
-}
-
-function dmToDeg(dmStr, hemi) {
-  if (!dmStr) return null;
-  const dot = dmStr.indexOf(".");
-  const degLen = (dot > 2) ? (dot - 2) : (dmStr.length - 2);
-  const deg = parseInt(dmStr.slice(0, degLen), 10);
-  const min = parseFloat(dmStr.slice(degLen));
-  let dec = deg + (min / 60);
-  if (hemi === "S" || hemi === "W") dec = -dec;
-  return dec;
-}
-
-function toDM(value, isLat) {
-  if (value == null) return { dm: null, hemi: null };
-  const abs = Math.abs(value);
-  const deg = Math.floor(abs);
-  const min = (abs - deg) * 60;
-  const degWidth = isLat ? 2 : 3;
-  const degStr = String(deg).padStart(degWidth, "0");
-  const minStr = min.toFixed(4).padStart(7, "0");
-  const dm = `${degStr}${minStr}`;
-  const hemi = isLat ? (value >= 0 ? "N" : "S") : (value >= 0 ? "E" : "W");
-  return { dm, hemi };
-}
-
-function nmeaChecksum(sentenceNoDollar) {
-  let sum = 0;
-  for (let i = 0; i < sentenceNoDollar.length; i++) sum ^= sentenceNoDollar.charCodeAt(i);
-  return sum.toString(16).toUpperCase().padStart(2, "0");
-}
-
-function buildGGAfromState() {
-  const f = state.lastFix || {};
-  if (f.lat == null || f.lon == null) return null;
-  const now = new Date();
-  const hh = String(now.getUTCHours()).padStart(2, "0");
-  const mm = String(now.getUTCMinutes()).padStart(2, "0");
-  const ss = String(now.getUTCSeconds()).padStart(2, "0");
-  const time = `${hh}${mm}${ss}.00`;
-  const latDM = toDM(f.lat, true);
-  const lonDM = toDM(f.lon, false);
-  const fixQ = Number.isInteger(f.fix) ? f.fix : 1; // 1 si inconnu
-  const sats = Number.isInteger(f.satsUsed) ? f.satsUsed : 12;
-  const hdop = (typeof f.hdop === "number" && !Number.isNaN(f.hdop)) ? f.hdop.toFixed(2) : "1.0";
-  const alt = (typeof f.alt === "number" && !Number.isNaN(f.alt)) ? f.alt.toFixed(1) : "0.0";
-  const geoid = "0.0";
-  const core = `GPGGA,${time},${latDM.dm},${latDM.hemi},${lonDM.dm},${lonDM.hemi},${fixQ},${sats},${hdop},${alt},M,${geoid},M,,`;
-  const chk = nmeaChecksum(core);
-  return `$${core}*${chk}\r\n`;
-}
-
-// -------------------- État --------------------
-const state = {
-  lastFix: null,
-  track: [],
-  stats: { nmea: 0, bad: 0, gga: 0, rmc: 0, gsv: 0 },
-  serialIn: { path: SERIAL_PATH, baud: SERIAL_BAUD },
-  serialOut: { path: null, baud: null, enabled: false, forwardCorrections: true },
-  ntrip: { connected: false, host: null, port: null, mount: null, bytes: 0, error: null }
-};
-
-let serialInPort = new SerialPort({ path: SERIAL_PATH, baudRate: SERIAL_BAUD });
-let serialOutPort = null;
-let ntripSocket = null;
-let ntripNmeaTimer = null; // timer d'envoi périodique GGA
-
-// -------------------- Parsers NMEA --------------------
-function handleGGA(parts) {
-  // $GxGGA,time,lat,NS,lon,EW,fix,satsUsed,hdop,alt,M,...
-  const lat = dmToDeg(parts[2], parts[3]);
-  const lon = dmToDeg(parts[4], parts[5]);
-  const fix = parseInt(parts[6] || "0", 10);
-  const satsUsed = parseInt(parts[7] || "0", 10);
-  const hdop = parseFloat(parts[8] || "0");
-  const alt = parseFloat(parts[9] || "0");
-  if (lat && lon) {
-    state.lastFix = { ...(state.lastFix || {}), lat, lon, alt, satsUsed, hdop, fix };
-    if (!state.track.length || (Math.abs(state.track[state.track.length - 1][0] - lat) > 1e-6 || Math.abs(state.track[state.track.length - 1][1] - lon) > 1e-6)) {
-      state.track.push([lat, lon]);
-      if (state.track.length > 5000) state.track.shift();
-    }
-  }
-}
-
-function handleRMC(parts) {
-  // $GxRMC,time,status,lat,NS,lon,EW,speed(kn),course(deg),date,...
-  const status = parts[2];
-  const lat = dmToDeg(parts[3], parts[4]);
-  const lon = dmToDeg(parts[5], parts[6]);
-  const speedKn = parseFloat(parts[7] || "0");
-  const course = parseFloat(parts[8] || "0");
-  const timeUTC = parts[1];
-  if (status === "A") {
-    const speedKmh = speedKn * 1.852;
-    const fixTime = timeUTC || null;
-    state.lastFix = { ...(state.lastFix || {}), lat, lon, speed: speedKmh, course, time: fixTime };
-    if (lat && lon) {
-      if (!state.track.length || (Math.abs(state.track[state.track.length - 1][0] - lat) > 1e-6 || Math.abs(state.track[state.track.length - 1][1] - lon) > 1e-6)) {
-        state.track.push([lat, lon]);
-        if (state.track.length > 5000) state.track.shift();
+app.get('/status', (req, res) => {
+  res.json({
+    ok: true,
+    serialIn: state.serialIn,
+    ntrip: state.ntrip,
+    lastFix: state.lastFix,
+    sat: {
+      inView: state.sat.inView,
+      tracked: state.sat.tracked,
+      used: state.sat.used,
+      dop: state.sat.dop,
+      perConstellation: {
+        GPS: state.sat.perConstellation.GPS,
+        GLONASS: state.sat.perConstellation.GLONASS,
+        GALILEO: state.sat.perConstellation.GALILEO,
+        BEIDOU: state.sat.perConstellation.BEIDOU,
+        OTHER: state.sat.perConstellation.OTHER
       }
     }
-  }
-}
+  });
+});
 
-function handleGSV(parts) {
-  // $GxGSV,totalMsgs,msgIdx,totalInView, ...
-  const totalInView = parseInt(parts[3] || "0", 10);
-  if (!Number.isNaN(totalInView)) {
-    state.lastFix = { ...(state.lastFix || {}), satsInView: totalInView };
-  }
-}
+io.on('connection', (socket) => {
+  socket.emit('hello', { ts: Date.now(), ntrip: state.ntrip });
 
-function parseNMEA(line) {
-  if (!line.startsWith("$") || !checksumOK(line)) { state.stats.bad++; return; }
-  state.stats.nmea++;
-  const star = line.indexOf("*");
-  const core = line.slice(1, star);
-  const parts = core.split(",");
-  const type = parts[0].slice(2);
-  if (type === "GGA") { state.stats.gga++; handleGGA(parts); }
-  else if (type === "RMC") { state.stats.rmc++; handleRMC(parts); }
-  else if (type === "GSV") { state.stats.gsv++; handleGSV(parts); }
-}
+  socket.on('ntripConnect', cfg => {
+    const { host, port, mount, user, pass } = cfg || {};
+    if (!host || !port || !mount) { state.ntrip.error = 'Missing host/port/mount'; broadcast(); return; }
 
-// -------------------- Broadcast UI --------------------
+    // MàJ de l'état + identifiants
+    state.ntrip = {
+      connected: false,
+      host,
+      port: parseInt(port, 10),
+      mount,
+      bytes: 0,
+      error: null,
+      lastGGAUpTs: null,
+      user,            // AJOUT
+      pass             // AJOUT
+    };
+
+    // Autorise la connexion (et d'éventuelles reconnexions) puis connecte
+    ntripShouldRun = true;
+    if (ntripRecoTimer) { clearTimeout(ntripRecoTimer); ntripRecoTimer = null; }
+    connectNTRIP();
+  });
+
+  socket.on('ntripDisconnect', () => {
+    // Interdire toute reconnexion automatique
+    ntripShouldRun = false;
+
+    // Stop timers (GGA périodique + reco)
+    if (ntripTimer) { clearInterval(ntripTimer); ntripTimer = null; }
+    if (ntripRecoTimer) { clearTimeout(ntripRecoTimer); ntripRecoTimer = null; }
+
+    // Coupe la socket si ouverte
+    try { ntripSock?.destroy(); } catch {}
+    ntripSock = null;
+
+    // État propre
+    state.ntrip.connected = false;
+    broadcast();
+  });
+});
+
 function broadcast() {
   io.emit("telemetry", {
     ts: Date.now(),
     lastFix: state.lastFix,
     stats: state.stats,
     track: state.track,
-    serial: state.serialIn,
-    serialOut: state.serialOut,
-    ntrip: state.ntrip
+    ntrip: state.ntrip,
+    sat: state.sat
   });
 }
 
-// -------------------- Serial IN (F9R) --------------------
-let buffer = "";
-serialInPort.on("data", chunk => {
-  const text = chunk.toString("utf8");
-  buffer += text;
+setInterval(broadcast, 1000);
+
+// ------------------------- Serial -------------------------
+let serialInPort = null;
+let serialLineBuf = '';
+
+function openSerial() {
+  return new Promise((resolve, reject) => {
+    if (serialInPort?.isOpen) return resolve(serialInPort);
+    serialInPort = new SerialPort({ path: SERIAL_PATH, baudRate: SERIAL_BAUD }, (err) => {
+      if (err) return reject(err);
+      log('[SERIAL] Opened', SERIAL_PATH, '@', SERIAL_BAUD);
+      serialInPort.on('data', onSerialData);
+      resolve(serialInPort);
+    });
+  });
+}
+
+function onSerialData(buf) {
+  // Bufferise lignes NMEA
+  const s = buf.toString('utf8');
+  serialLineBuf += s;
   let idx;
-  while ((idx = buffer.indexOf("\n")) >= 0) {
-    const line = buffer.slice(0, idx).trim();
-    buffer = buffer.slice(idx + 1);
-    if (!line) continue;
-    // Rediffusion NMEA vers le port série OUT
-    if (state.serialOut.enabled && serialOutPort && line.startsWith("$")) {
-      try { serialOutPort.write(line + "\r\n"); } catch (e) {}
-    }
-    parseNMEA(line);
+  while ((idx = serialLineBuf.indexOf('\n')) >= 0) {
+    const line = serialLineBuf.slice(0, idx).trim();
+    serialLineBuf = serialLineBuf.slice(idx + 1);
+    if (line.startsWith('$')) parseNMEA(line);
   }
-});
-
-serialInPort.on("open", () => { console.log(`[Serial-IN] ${SERIAL_PATH} @ ${SERIAL_BAUD}`); });
-serialInPort.on("error", err => { console.error("[Serial-IN]", err.message); });
-
-// -------------------- NTRIP (client) --------------------
-function startNtripNmeaTimer() {
-  if (ntripNmeaTimer) { clearInterval(ntripNmeaTimer); ntripNmeaTimer = null; }
-  if (!state.ntrip.connected) return;
-  const interval = Math.max(5, Math.min(60, NTRIP_NMEA_INTERVAL_SEC)) * 1000;
-  ntripNmeaTimer = setInterval(() => {
-    if (!ntripSocket) return;
-    const gga = buildGGAfromState();
-    if (gga) {
-      try { ntripSocket.write(gga); } catch (_) {}
-    }
-  }, interval);
 }
 
-io.on("connection", socket => {
-  socket.emit("hello", { serial: state.serialIn, serialOut: state.serialOut, ntrip: state.ntrip });
+// ------------------------- NMEA parsing -------------------
+function checksumOK(line) {
+  const star = line.indexOf('*');
+  if (star < 0) return false;
+  const payload = line.slice(1, star);
+  const given = line.slice(star + 1).trim();
+  let cs = 0;
+  for (let i = 0; i < payload.length; i++) cs ^= payload.charCodeAt(i);
+  const hex = cs.toString(16).toUpperCase().padStart(2, '0');
+  return hex === given.toUpperCase();
+}
 
-  // ---- Sortie série locale ----
-  socket.on("configureSerialOut", cfg => {
-    const { path, baud, enabled, forwardCorrections } = cfg || {};
-    state.serialOut.enabled = !!enabled;
-    state.serialOut.forwardCorrections = forwardCorrections !== false;
-    if (!path || !baud || !enabled) {
-      if (serialOutPort) { try { serialOutPort.close(); } catch (e) {} serialOutPort = null; }
-      state.serialOut.path = null; state.serialOut.baud = null; broadcast(); return;
+function talkerOf(id) { return (id && id.slice(0,2)) || 'GN'; }
+function constelFromTalker(t) {
+  switch (t) { case 'GP': return 'GPS'; case 'GL': return 'GLONASS'; case 'GA': return 'GALILEO'; case 'GB': return 'BEIDOU'; default: return 'OTHER'; }
+}
+function recomputeUsedCounters() {
+  const per = state.sat.perConstellation;
+  for (const k of Object.keys(per)) per[k].used = 0;
+  const globalUsed = new Set();
+  for (const [k,setv] of Object.entries(state.sat._usedByConst)) {
+    per[k].used = setv.size; setv.forEach(prn => globalUsed.add(prn));
+  }
+  state.sat.used = Array.from(globalUsed);
+}
+
+function dmToDeg(dm, hemi) {
+  if (!dm || !hemi) return null;
+  const v = parseFloat(dm);
+  if (!Number.isFinite(v)) return null;
+  const d = Math.floor(v / 100);
+  const m = v - d * 100;
+  let deg = d + m / 60;
+  if (hemi === 'S' || hemi === 'W') deg = -deg;
+  return deg;
+}
+
+function handleGGA(parts) {
+  // $GxGGA,time,lat,NS,lon,EW,fix,satsUsed,hdop,alt,M,geoid,M,age,refId
+  const lat = dmToDeg(parts[2], parts[3]);
+  const lon = dmToDeg(parts[4], parts[5]);
+  const fix = parseInt(parts[6] || '0', 10);
+  const satsUsed = parseInt(parts[7] || '0', 10);
+  const hdop = parseFloat(parts[8] || 'NaN');
+  const alt = parseFloat(parts[9] || 'NaN');
+  const age = parts[13] ? parseFloat(parts[13]) : null;
+  const refId = parts[14] ? parts[14].split('*')[0] : null;
+
+  state.lastFix = {
+    ...(state.lastFix || {}),
+    lat, lon, fix, satsUsed, hdop, alt,
+    ageCorrections: Number.isFinite(age) ? age : null,
+    refStationId: refId || null
+  };
+
+  // GGA brute pour VRS
+  const star = parts.join(',').indexOf('*');
+  // Reconstituer la ligne originale (plus simple : on mémorise la dernière ligne valide dans parseNMEA)
+}
+
+function handleRMC(parts) {
+  // $GxRMC,time,status,lat,NS,lon,EW,speed,cog,date,...
+  const lat = dmToDeg(parts[3], parts[4]);
+  const lon = dmToDeg(parts[5], parts[6]);
+  state.lastFix = { ...(state.lastFix || {}), lat: (lat ?? state.lastFix?.lat), lon: (lon ?? state.lastFix?.lon) };
+}
+
+function handleGSV(parts) {
+  // $GxGSV,totalMsgs,msgIdx,totalInView,(PRN,Elev,Az,SNR)...
+  const talker = parts[0].slice(0, 2); // "GP","GL","GA","GB",...
+  let C = "OTHER";
+  if (talker === "GP") C = "GPS";
+  else if (talker === "GL") C = "GLONASS";
+  else if (talker === "GA") C = "GALILEO";
+  else if (talker === "GB") C = "BEIDOU";
+                                                                                      
+  const totalMsgs   = parseInt(parts[1] || '1', 10);
+  const msgIdx      = parseInt(parts[2] || '1', 10);
+  const totalInView = parseInt(parts[3] || '0', 10);
+
+  const seq = state.sat.gsvSeq[talker] || { totalMsgs, got: {}, list: [], totalInView: 0 };
+  seq.totalMsgs   = totalMsgs;
+  seq.totalInView = totalInView;
+  seq.got[msgIdx] = true;
+
+  for (let i = 4; i + 3 < parts.length; i += 4) {
+    const prn  = parts[i] && parts[i].trim();
+    const elev = parseInt(parts[i+1] || 'NaN', 10);
+    const az   = parseInt(parts[i+2] || 'NaN', 10);
+    const snr  = parseInt(parts[i+3] || 'NaN', 10);
+    if (prn) {
+      seq.list.push({ prn, elev, az, snr });
+      state.satIndexByPRN.set(String(prn), C);
+    //state.sat.satIndexByPRN.set(String(prn), C); // index PRN -> constellation
     }
-    if (serialOutPort) { try { serialOutPort.close(); } catch (e) {} serialOutPort = null; }
-    state.serialOut.path = path; state.serialOut.baud = parseInt(baud, 10);
-    serialOutPort = new SerialPort({ path, baudRate: state.serialOut.baud }, err => {
-      if (err) { console.error("[Serial-OUT] open error:", err.message); state.serialOut.enabled = false; }
-      broadcast();
-    });
+  }
+  state.sat.gsvSeq[talker] = seq;
+
+  if (Object.keys(seq.got).length === seq.totalMsgs) {
+    const inView  = seq.totalInView || seq.list.length;
+    const tracked = seq.list.filter(s => Number.isFinite(s.snr) && s.snr > 0).length;
+
+    state.sat._talker[talker] = { inView, tracked };
+    state.sat.perConstellation[C].inView = inView;
+
+    // totaux
+    let totalInViewAll = 0, totalTrackedAll = 0;
+    for (const t of Object.values(state.sat._talker)) {
+      totalInViewAll += t.inView || 0;
+      totalTrackedAll += t.tracked || 0;
+    }
+    state.sat.inView  = totalInViewAll;
+    state.sat.tracked = totalTrackedAll;
+    // rétro compat
+    state.lastFix = { ...(state.lastFix || {}), satsInView: state.sat.inView };
+
+    // reset
+    state.sat.gsvSeq[talker] = { totalMsgs: 0, got: {}, list: [], totalInView: 0 };
+  }
+}
+
+function handleGSA(parts) {
+  // $GxGSA,modeSel,fixType,s1..s12,PDOP,HDOP,VDOP
+  const talker = talkerOf(parts[0]);
+  const usedNow = [];
+  for (let i = 3; i <= 14; i++) {
+    const v = parts[i] && parts[i].trim();
+    if (v) usedNow.push(v);
+  }
+
+  const pdop = parseFloat(parts[15] || 'NaN');
+  const hdop = parseFloat(parts[16] || 'NaN');
+  const vdop = parseFloat(parts[17] || 'NaN');
+  state.sat.dop = {
+    pdop: Number.isFinite(pdop) ? pdop : state.sat.dop.pdop,
+    hdop: Number.isFinite(hdop) ? hdop : state.sat.dop.hdop,
+    vdop: Number.isFinite(vdop) ? vdop : state.sat.dop.vdop
+  };
+
+  const assign = (constel, prn) => state.sat._usedByConst[constel].add(prn);
+  const specificConstel = constelFromTalker(talker);
+
+  for (const prn of usedNow) {
+    let C = null;
+    if (specificConstel && specificConstel !== 'OTHER') {
+      C = specificConstel;
+    } else {
+      C = state.satIndexByPRN.get(String(prn)) || null;
+      //C = state.sat.satIndexByPRN.get(String(prn)) || null;
+      if (!C) {
+        const id = parseInt(prn, 10);
+        if (id >= 1 && id <= 32) C = 'GPS';
+        else if (id >= 65 && id <= 96) C = 'GLONASS';
+        else if (id >= 201 && id <= 237) C = 'BEIDOU';
+        else if ((id >= 301 && id <= 336) || (id >= 1 && id <= 36)) C = 'GALILEO'; // Galileo 1–36 fallback
+        else C = 'OTHER';
+      }
+    }
+    assign(C, prn);
+  }
+  recomputeUsedCounters();
+}
+
+function parseNMEA(line) {
+  if (!checksumOK(line)) { state.stats.bad++; return; }
+  state.stats.nmea++;
+  state._lastNMEALine = line; // pour debug
+
+  // Mémorise la dernière GGA brute pour VRS
+  if (line.includes('GGA')) state.lastGGALine = line;
+
+  const star = line.indexOf('*');
+  const core = line.slice(1, star);
+  const parts = core.split(',');
+  const type = parts[0].slice(2);
+
+  if (type === 'GGA') { state.stats.gga++; handleGGA(parts); }
+  else if (type === 'RMC') { state.stats.rmc++; handleRMC(parts); }
+  else if (type === 'GSV') { state.stats.gsv++; handleGSV(parts); }
+  else if (type === 'GSA') { state.stats.gsa++; handleGSA(parts); }
+}
+
+// ------------------------- NTRIP --------------------------
+let ntripSock = null;
+let ntripHeaderParsed = false;
+let ntripHeaderBuf = '';
+let ntripTimer = null;
+    
+// AJOUT : contrôle de (re)connexion piloté par la GUI
+let ntripShouldRun = false;     // true = autoriser connexion/reconnexion ; false = rester déconnecté
+let ntripRecoTimer = null;      // timer de reconnexion différée
+    
+function connectNTRIP() {
+    if (!ntripShouldRun) return;
+    
+  ntripHeaderParsed = false;
+  ntripHeaderBuf = '';
+
+  const auth = Buffer.from(`${NTRIP_USER}:${NTRIP_PASS}`).toString('base64');
+  const req =
+    `GET /${encodeURIComponent(NTRIP_MOUNT)} HTTP/1.1\r\n` +
+    `Host: ${NTRIP_HOST}\r\n` +
+    `Ntrip-Version: Ntrip/2.0\r\n` +
+    `User-Agent: KinoCaster/usb-single\r\n` +
+    `Connection: close\r\n` +
+    `Authorization: Basic ${auth}\r\n\r\n`;
+
+  log('[NTRIP] Connecting to', `${NTRIP_HOST}:${NTRIP_PORT}`, 'mount', NTRIP_MOUNT);
+  ntripSock = net.createConnection({ host: NTRIP_HOST, port: NTRIP_PORT }, async () => {
+    try { await openSerial(); } catch (e) { log('[SERIAL] Open error:', e.message); }
+    ntripSock.write(req);
   });
 
-  // ---- Connexion NTRIP ----
-  socket.on("ntripConnect", cfg => {
-    const { host, port, mount, user, pass } = cfg || {};
-    if (!host || !port || !mount) { state.ntrip.error = "Missing host/port/mount"; broadcast(); return; }
-    if (ntripSocket) { try { ntripSocket.destroy(); } catch (e) {} ntripSocket = null; }
-    state.ntrip = { connected: false, host, port, mount, bytes: 0, error: null };
+  ntripSock.on('data', (chunk) => {
+    if (!ntripHeaderParsed) {
+      ntripHeaderBuf += chunk.toString('utf8');
+      const idx = ntripHeaderBuf.indexOf('\r\n\r\n');
+      if (idx === -1) return;
 
-    ntripSocket = net.createConnection({ host, port: parseInt(port, 10) }, () => {
-      const auth = (user && pass) ? Buffer.from(`${user}:${pass}`).toString("base64") : null;
-      const headers = [
-        `GET /${mount} HTTP/1.1`,
-        `Host: ${host}`,
-        `User-Agent: F9R-Dashboard/0.1`,
-        `Ntrip-Version: Ntrip/2.0`,
-        auth ? `Authorization: Basic ${auth}` : null,
-        `Connection: keep-alive`,
-        "\r\n"
-      ].filter(Boolean).join("\r\n");
-      try { ntripSocket.write(headers); } catch (_) {}
-      // Envoi initial d'une GGA dès la connexion TCP
-      const gga = buildGGAfromState();
-      if (gga) { try { ntripSocket.write(gga); } catch (_) {} }
-    });
+      const header = ntripHeaderBuf.slice(0, idx);
+      const rest = Buffer.from(ntripHeaderBuf.slice(idx + 4), 'binary');
 
-    let headerBuf = ""; let streaming = false;
+      if (header.startsWith('ICY 200') || header.startsWith('HTTP/1.0 200') || header.startsWith('HTTP/1.1 200')) {
+        log('[NTRIP] 200 OK — streaming RTCM');
+        state.ntrip.connected = true;
+        state.ntrip.error = null;
+        ntripHeaderParsed = true;
+        ntripHeaderBuf = '';
 
-    ntripSocket.on("data", data => {
-      if (!streaming) {
-        headerBuf += data.toString("utf8");
-        const sep = headerBuf.indexOf("\r\n\r\n");
-        if (sep >= 0) {
-          const header = headerBuf.slice(0, sep);
-          streaming = /(200 OK|ICY 200 OK)/i.test(header);
-          if (!streaming) {
-            state.ntrip.error = header.split("\n")[0].trim();
-            try { ntripSocket.destroy(); } catch (_) {}
-            broadcast();
-            return;
-          }
-          // Connexion validée → démarrer le timer GGA périodique
-          state.ntrip.connected = true;
-          startNtripNmeaTimer();
-          const leftover = Buffer.from(headerBuf.slice(sep + 4), "utf8");
-          if (leftover.length) ntripSocket.emit("data", leftover);
+        if (rest.length && serialInPort?.isOpen) {
+          try { serialInPort.write(rest); state.ntrip.bytes += rest.length; } catch (_) {}
         }
-        return;
-      }
-      state.ntrip.connected = true;
-      state.ntrip.bytes += data.length;
-      if (state.serialOut.enabled && state.serialOut.forwardCorrections && serialOutPort) {
-        try { serialOutPort.write(data); } catch (_) {}
-      }
-    });
 
-    ntripSocket.on("error", err => { state.ntrip.error = err.message; broadcast(); });
-    ntripSocket.on("close", () => {
+        // Envoi périodique de la GGA au caster (si activé)
+        if (NTRIP_SEND_GGA && !ntripTimer) {
+          ntripTimer = setInterval(() => {
+            if (!state.lastGGALine) return;
+            try {
+              // Format NTRIP: chaque NMEA en CRLF
+              const line = state.lastGGALine.trim();
+              const payload = line.endsWith('\r\n') ? line : (line + '\r\n');
+              ntripSock.write(payload);
+              state.ntrip.lastGGAUpTs = Date.now();
+            } catch {}
+          }, NTRIP_NMEA_INTERVAL_SEC * 1000);
+        }
+
+      } else {
+        log('[NTRIP] Unexpected response:\n' + header);
+        ntripSock.destroy();
+      }
+      return;
+    }
+
+    // Après l’en-tête => payload RTCM
+    if (serialInPort?.isOpen) {
+      try { serialInPort.write(chunk); state.ntrip.bytes += chunk.length; } catch (_) {}
+    }
+  });
+
+  ntripSock.on('error', (err) => {
+    state.ntrip.error = err.message;
+    log('[NTRIP] Error:', err.message);
+  });
+
+    ntripSock.on('close', () => {
+      log('[NTRIP] Closed');
       state.ntrip.connected = false;
-      if (ntripNmeaTimer) { clearInterval(ntripNmeaTimer); ntripNmeaTimer = null; }
-      broadcast();
+
+      if (ntripTimer) { clearInterval(ntripTimer); ntripTimer = null; }
+      if (ntripRecoTimer) { clearTimeout(ntripRecoTimer); ntripRecoTimer = null; }
+
+      // Reconnexion uniquement si demandé par la GUI
+      if (ntripShouldRun) {
+        ntripRecoTimer = setTimeout(() => {
+          ntripRecoTimer = null;
+          connectNTRIP();
+        }, 3000);
+      }
     });
-  });
 
-  socket.on("ntripDisconnect", () => {
-    if (ntripSocket) { try { ntripSocket.destroy(); } catch (_) {} }
-    ntripSocket = null; state.ntrip.connected = false;
-    if (ntripNmeaTimer) { clearInterval(ntripNmeaTimer); ntripNmeaTimer = null; }
-    broadcast();
-  });
+}
+
+// ------------------------- Boot --------------------------
+function log(...a) { console.log(new Date().toISOString(), ...a); }
+
+server.listen(HTTP_PORT, () => {
+  log(`[HTTP] Listening on :${HTTP_PORT}`);
+  openSerial().catch(e => log('[BOOT] serial open failed:', e.message));
 });
-
-setInterval(broadcast, 250);
-
-httpServer.listen(HTTP_PORT, () => { console.log(`[HTTP] http://localhost:${HTTP_PORT}`); });

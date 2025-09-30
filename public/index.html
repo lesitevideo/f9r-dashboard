@@ -42,9 +42,32 @@
             </div>
           </div>
             
+<div class="card shadow-sm mt-3">
+  <div class="card-body">
+    <h5 class="card-title">Satellites</h5>
+
+    <div class="row row-cols-2 g-2 small">
+      <div><strong>Tracked (SNR&gt;0):</strong> <span id="satsTracked">0</span></div>
+      <div><strong>Used (liste GSA):</strong> <span id="satsUsedList">—</span></div>
+      <div><strong>PDOP:</strong> <span id="pdop">—</span></div>
+      <div><strong>VDOP:</strong> <span id="vdop">—</span></div>
+    </div>
+
+    <hr/>
+
+    <div class="row row-cols-2 g-2 small">
+      <div><strong>GPS:</strong> <span id="gpsCounts">0 used / 0 in view</span></div>
+      <div><strong>GLONASS:</strong> <span id="gloCounts">0 used / 0 in view</span></div>
+      <div><strong>GALILEO:</strong> <span id="galCounts">0 used / 0 in view</span></div>
+      <div><strong>BEIDOU:</strong> <span id="bdsCounts">0 used / 0 in view</span></div>
+    </div>
+  </div>
+</div>
+            
+            
 
       <div class="row g-3 mt-3">
-        <div class="col-12 d-none">
+        <div class="col-12">
           <div class="card shadow-sm">
             <div class="card-body">
               <h5 class="card-title">Sortie NMEA locale</h5>

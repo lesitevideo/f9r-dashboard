@@ -24,7 +24,8 @@ function ensureMap(lat, lon) {
 function updateTelemetry(msg) {
   const s = msg.lastFix || {};
   const st = msg.stats || {};
-  //console.log(msg);
+  const sat = msg.sat || {};    
+  console.log(msg);
   document.getElementById("serialInfo").textContent = `${msg.serial?.path || ""} @ ${msg.serial?.baud || ""}`;
   document.getElementById("fixType").textContent = fixLabel(s.fix);
   document.getElementById("sats").textContent = `${s.satsUsed ?? 0} / ${s.satsInView ?? 0}`;
@@ -39,7 +40,33 @@ function updateTelemetry(msg) {
   document.getElementById("bad").textContent = st.bad ?? 0;
   document.getElementById("gga").textContent = st.gga ?? 0;
   document.getElementById("rmc").textContent = st.rmc ?? 0;
+                                                
+  // Totaux globaux
+  document.getElementById("satsTracked").textContent = sat.tracked ?? 0;
 
+  // Liste des PRN utilisés (GSA)
+  const usedList = Array.isArray(sat.used) ? sat.used.join(", ") : "";
+  document.getElementById("satsUsedList").textContent = usedList || "—";
+
+  // DOP (GSA)
+  const dop = sat.dop || {};
+  document.getElementById("pdop").textContent = Number.isFinite(dop.pdop) ? dop.pdop : "—";
+  document.getElementById("vdop").textContent = Number.isFinite(dop.vdop) ? dop.vdop : "—";
+  
+  // Par constellation
+  const pc = sat.perConstellation || {};
+  const gps  = pc.GPS     || { used: 0, inView: 0 };
+  const glo  = pc.GLONASS || { used: 0, inView: 0 };
+  const gal  = pc.GALILEO || { used: 0, inView: 0 };
+  const bds  = pc.BEIDOU  || { used: 0, inView: 0 };
+
+  const fmt = (o) => `${o.used ?? 0} used / ${o.inView ?? 0} in view`;
+  document.getElementById("gpsCounts").textContent = fmt(gps);
+  document.getElementById("gloCounts").textContent = fmt(glo);
+  document.getElementById("galCounts").textContent = fmt(gal);
+  document.getElementById("bdsCounts").textContent = fmt(bds);
+    
+    
   // Serial OUT status
   const out = msg.serialOut || {};
   const outStatus = out.enabled && out.path ? `Actif → ${out.path} @ ${out.baud}` : "Inactif";
